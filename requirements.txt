@@ -1,0 +1,5 @@
+# 项目运行依赖
+# 安装: pip install -r requirements.txt
+
+pandas>=2.0
+matplotlib>=3.7
