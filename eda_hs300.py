@@ -14,21 +14,21 @@ plt.rcParams['axes.unicode_minus'] = False
 # encoding='utf-8-sig': 两文件都带 BOM 头, 用普通 utf-8 会把首列名读成 "﻿股票代码"
 price = pd.read_csv('data/stock_data.csv', encoding='utf-8-sig', dtype={'股票代码': str})
 ind = pd.read_csv('data/industry.csv', encoding='utf-8-sig', dtype={'stock_code': str})
-print(f'行情表 {price.shape} | 维度表 {ind.shape}')
-print(price.head(3)); price.info()
+print(f'行情表 {price.shape} | 维度表 {ind.shape}'); print(price.head(3)); price.info()
 
 # ===== 第二步: 数据清洗 =====
 # 2.1 日期转换: 原值为字符串, 不转 datetime 就无法按年/月分组
 price['日期'] = pd.to_datetime(price['日期'])
 # 2.2 排序: ffill 是"按顺序向下带值", 顺序错就会取到错误日期的值, 必须先按 股票+日期 排好
 price = price.sort_values(['股票代码', '日期'])
-# 2.3 缺失值: 缺失集中在 23 只个股的停牌日, 用 ffill 前向填充, 且必须 groupby 分股票填充
-#     为何不用均值填充: ①均值用了全期数据, 把未来信息泄露给了过去;
-#     ②成交/价格是连续序列, 停牌的真实业务含义就是"沿用上一交易日", 均值会破坏连续性;
-#     ③均值会凭空造出当天并不存在的成交量, 污染后续的波动率计算
+# 2.3 缺失值: 233 个缺失集中在 23 只个股的停牌日。判定依据不是猜, 而是缺失行本身满足
+#     开盘=收盘=最高=最低、振幅=0、涨跌额=0 —— 这是停牌的教科书特征(价格被填成停牌前收盘价占位)。
+#     用均值填充会踩三个坑: ①均值用了全期数据, 把未来信息泄露给过去; ②停牌的业务含义本就是
+#     "沿用上一交易日"; ③本项目要算收益率标准差, 插入均值会人为压低方差, 使波动率被系统性低估。
 vol_cols = ['成交量', '成交额', '换手率']
 price[vol_cols] = price.groupby('股票代码')[vol_cols].ffill()
-price['涨跌幅'] = price['涨跌幅'].fillna(0)  # 停牌当日无成交 -> 收益本就应为 0, 比 ffill 更准确
+# 停牌当日无成交, 涨跌额本就是 0, 因此收益填 0 而非 ffill —— 同一张表不同字段要按业务含义分开处理
+price['涨跌幅'] = price['涨跌幅'].fillna(0)
 # 2.4 去重: 按整行判断。重复行会让同一笔成交被统计两次, 直接虚增成交量与收益
 n0 = len(price); price = price.drop_duplicates()
 print(f'去重 {n0 - len(price)} 行, 残留缺失 {int(price.isna().sum().sum())} 个')
@@ -40,28 +40,31 @@ df = pd.merge(price, ind, left_on='股票代码', right_on='stock_code', how='le
 print(f'维度表关联率 {df["industry"].notna().mean():.2%}, 未匹配 {int(df["industry"].isna().sum())} 行')
 
 # ===== 第四步: 多维度分析 =====
-df['日收益率'] = df['涨跌幅'] / 100        # 涨跌幅单位是 %, 除以 100 得到小数收益率
-df['月份'] = df['日期'].dt.to_period('M')  # 预造月份列, 供分组与透视使用
-# 4.1 行业 × 月份: 月均收益率衡量赚钱能力, 月波动率(收益率标准差)衡量风险水平
-monthly = df.groupby(['industry', '月份'])['日收益率'].agg(月均收益率='mean', 月波动率='std').reset_index()
-# 4.2 行业总览: 把各月指标在行业维度再求平均, 得到行业整体画像, 并按收益降序排列
-sector = monthly.groupby('industry')[['月均收益率', '月波动率']].mean().sort_values('月均收益率', ascending=False)
-sector['收益波动比'] = sector['月均收益率'] / sector['月波动率']  # 每承担 1 单位风险换来的收益
+df['日收益率'] = df['涨跌幅'] / 100  # 涨跌幅单位是 %, 除以 100 得到小数收益率
+# 4.1 行业总览: 直接对【日收益率】求均值与标准差。不用"先算各月均值、再把各月平均"的两步法 ——
+#     各月交易日数不同(实测 50~115 天), 两步平均等于给"月"等权而非给"天"等权, 实测偏差最高 36.7% 且改变排名
+sector = df.groupby('industry')['日收益率'].agg(日均收益率='mean', 日波动率='std')
+sector = sector.sort_values('日均收益率', ascending=False)
+sector['收益波动比'] = sector['日均收益率'] / sector['日波动率']  # 每承担 1 单位风险换来的收益
 print('\n各行业整体表现(按收益降序):'); print(sector.round(5).to_string())
-# 4.3 数据透视表: 行=行业, 列=年份, 值=收益率标准差, 用来观察波动率随时间的变化
-pivot = pd.pivot_table(df, values='日收益率', index='industry', columns=df['日期'].dt.year, aggfunc='std')
-print('\n行业 × 年份 波动率透视表:'); print(pivot.round(5).to_string())
+# 4.2 月度视角: 行业 × 月份 的日均收益率, 用于观察各行业的月度节奏差异
+monthly = df.groupby(['industry', df['日期'].dt.to_period('M')])['日收益率'].mean().unstack()
+print('\n行业 × 月份 日均收益率:'); print(monthly.round(4).to_string())
+# 4.3 数据透视表: 行=行业, 列=年份, 值=收益率标准差。只取 1-3 月: 数据截至 2026-03-13,
+#     2026 仅 44 个交易日而 2024/2025 各有 242/243 天, 用 3 个月的标准差比 12 个月的不公平, 须同区间才可比
+q1 = df[df['日期'].dt.month <= 3]
+pivot = pd.pivot_table(q1, values='日收益率', index='industry', columns=q1['日期'].dt.year, aggfunc='std')
+print('\n行业 × 年份 波动率透视表(均只取 1-3 月, 可比口径):'); print(pivot.round(5).to_string())
 
 # ===== 第五步: 可视化 =====
-# 图1: 各行业月均收益率对比。用单色即可 —— 柱高已经表达了大小, 彩虹配色反而干扰阅读
+# 图1: 各行业日均收益率对比。用单色即可 —— 柱高已经表达了大小, 彩虹配色反而干扰阅读
 plt.figure(figsize=(11, 5))
-plt.bar(sector.index, sector['月均收益率'] * 100, color='#4C78A8')
+plt.bar(sector.index, sector['日均收益率'] * 100, color='#4C78A8')
 plt.axhline(0, color='gray', linewidth=1)  # 0 轴参考线, 用于区分正负收益
-plt.title('沪深300各行业月均收益率对比(申万一级行业)')
-plt.xlabel('行业'); plt.ylabel('月均收益率(%)')
+plt.title('沪深300各行业日均收益率对比(申万一级行业)')
+plt.xlabel('行业'); plt.ylabel('日均收益率(%)')
 plt.xticks(rotation=90); plt.grid(axis='y', alpha=0.3)  # 网格弱化, 不与数据抢视觉
 plt.tight_layout(); plt.savefig('chart1_行业收益率对比.png', dpi=150)
-
 # 图2: 取收益率第一的行业, 用该行业内累计成交额最大的股票作为代表股, 画其收盘价走势
 top_ind = sector.index[0]
 sub = df[df['industry'] == top_ind]
